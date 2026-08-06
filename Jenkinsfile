@@ -1538,18 +1538,78 @@ summary.append(f"Gitleaks findings: {gitleaks_count}")
 total += gitleaks_count
 
 semgrep_path = reports / "semgrep" / "penpot-source.json"
+semgrep_results = []
+canary_findings = []
+
+canary_rule_ids = {
+    "intentionally-vulnerable-eval-canary",
+    "intentionally-vulnerable-shell-canary",
+    "intentionally-vulnerable-os-system-canary",
+}
 
 if semgrep_path.exists():
     try:
         semgrep_data = json.loads(semgrep_path.read_text() or "{}")
-        semgrep_count = len(semgrep_data.get("results", []))
+        semgrep_results = semgrep_data.get("results") or []
+        semgrep_count = len(semgrep_results)
+
+        for finding in semgrep_results:
+            rule = str(finding.get("check_id", "unknown-rule"))
+            normalized_rule = rule.rsplit(".", 1)[-1]
+
+            if normalized_rule not in canary_rule_ids:
+                continue
+
+            path = finding.get("path", "unknown-file")
+            line = (finding.get("start") or {}).get("line", "?")
+            severity = (finding.get("extra") or {}).get(
+                "severity",
+                "ERROR",
+            )
+            message = (finding.get("extra") or {}).get(
+                "message",
+                "Intentional security canary detected.",
+            )
+
+            canary_findings.append(
+                f"[{severity}] {normalized_rule} - "
+                f"{path}:{line} - {message}"
+            )
     except Exception:
         semgrep_count = 0
+        canary_findings = []
 else:
     semgrep_count = 0
 
+canary_count = len(canary_findings)
+
 summary.append(f"Semgrep Penpot source findings: {semgrep_count}")
+summary.append(f"Intentional vulnerability-canary findings: {canary_count}")
 total += semgrep_count
+
+notification = reports / "notification"
+notification.mkdir(parents=True, exist_ok=True)
+
+(notification / "canary-count.txt").write_text(
+    str(canary_count),
+    encoding="utf-8",
+)
+
+if canary_findings:
+    canary_text = (
+        "INTENTIONAL SECURITY CANARY DETECTED\n"
+        + "\n".join(canary_findings)
+        + "\n"
+    )
+else:
+    canary_text = "No intentional security-canary findings detected.\n"
+
+(notification / "canary-findings.txt").write_text(
+    canary_text,
+    encoding="utf-8",
+)
+
+print(canary_text)
 
 filesystem_count = count_trivy(reports / "trivy-filesystem.json")
 summary.append(f"Trivy filesystem findings: {filesystem_count}")
@@ -1600,7 +1660,6 @@ total += dependency_count
 summary.append(f"Total automated findings: {total}")
 summary_text = "\\n".join(summary) + "\\n"
 
-notification = reports / "notification"
 notification.mkdir(parents=True, exist_ok=True)
 
 (notification / "security-summary.txt").write_text(summary_text)
@@ -1615,13 +1674,15 @@ PYTHON_SUMMARY
         stage('Email Developer Notification') {
             steps {
                 script {
-                    String notificationRecipient = (notificationRecipient ?: '').trim()
+                    String notificationRecipient = (params.DEVELOPER_EMAIL ?: '').trim()
                     if (!notificationRecipient) {
                         notificationRecipient = 'evan246810536546@gmail.com'
                     }
 
                     int findingCount = 0
+                    int canaryCount = 0
                     String summaryText = 'Security findings were detected, but the summary file was unavailable.'
+                    String canaryText = 'No intentional security-canary details were available.'
 
                     if (fileExists('reports/notification/finding-count.txt')) {
                         String rawCount = readFile(
@@ -1639,7 +1700,27 @@ PYTHON_SUMMARY
                         ).trim()
                     }
 
-                    if (findingCount > 0) {
+                    if (fileExists('reports/notification/canary-count.txt')) {
+                        String rawCanaryCount = readFile(
+                            'reports/notification/canary-count.txt'
+                        ).trim()
+
+                        if (rawCanaryCount ==~ /[0-9]+/) {
+                            canaryCount = rawCanaryCount.toInteger()
+                        }
+                    }
+
+                    if (fileExists('reports/notification/canary-findings.txt')) {
+                        canaryText = readFile(
+                            'reports/notification/canary-findings.txt'
+                        ).trim()
+                    }
+
+                    if (findingCount > 0 || canaryCount > 0) {
+                        String emailSubject = canaryCount > 0
+                            ? "[Penpot DevSecOps] SECURITY CANARY DETECTED (${canaryCount}) - Build #${env.BUILD_NUMBER}"
+                            : "[Penpot DevSecOps] ${findingCount} security findings detected - Build #${env.BUILD_NUMBER}"
+
                         String emailBody = [
                             'Penpot DevSecOps detected security findings.',
                             '',
@@ -1651,6 +1732,9 @@ PYTHON_SUMMARY
                             'Security summary:',
                             summaryText,
                             '',
+                            'Controlled vulnerability-canary result:',
+                            canaryText,
+                            '',
                             'Jenkins build:',
                             env.BUILD_URL,
                             '',
@@ -1660,10 +1744,10 @@ PYTHON_SUMMARY
 
                         emailext(
                             to: notificationRecipient,
-                            subject: "[Penpot DevSecOps] ${findingCount} security findings detected - Build #${env.BUILD_NUMBER}",
+                            subject: emailSubject,
                             mimeType: 'text/plain',
                             attachLog: false,
-                            attachmentsPattern: 'reports/notification/security-summary.txt',
+                            attachmentsPattern: 'reports/notification/security-summary.txt,reports/notification/canary-findings.txt,reports/semgrep/penpot-source-summary.txt',
                             body: emailBody
                         )
 
@@ -1673,10 +1757,17 @@ PYTHON_SUMMARY
                                 'Email notification sent.',
                                 "Recipient: ${notificationRecipient}",
                                 "Finding count: ${findingCount}",
+                                "Canary count: ${canaryCount}",
                                 "Build: ${env.BUILD_URL}",
                                 ''
                             ].join('\n')
                         )
+
+                        if (canaryCount > 0) {
+                            echo "SECURITY CANARY DETECTED: ${canaryCount} controlled vulnerable-code finding(s)."
+                            echo canaryText
+                            currentBuild.result = 'UNSTABLE'
+                        }
 
                         echo "Security notification emailed to ${notificationRecipient}."
                     } else {
@@ -1741,7 +1832,7 @@ PYTHON_SUMMARY
 
         failure {
             script {
-                String failureRecipient = (failureRecipient ?: '').trim()
+                String failureRecipient = (params.DEVELOPER_EMAIL ?: '').trim()
                 if (!failureRecipient) {
                     failureRecipient = 'evan246810536546@gmail.com'
                 }
