@@ -122,7 +122,7 @@ pipeline {
                     mkdir -p semgrep-rules
 
                     find scripts -type f -name "*.sh" \
-                        -exec chmod +x {} \; 2>/dev/null || true
+                        -exec chmod +x {} + 2>/dev/null || true
                 '''
             }
         }
