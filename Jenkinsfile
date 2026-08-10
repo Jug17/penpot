@@ -3,34 +3,8 @@ pipeline {
         label 'built-in'
     }
 
-    parameters {
-        booleanParam(
-            name: 'RUN_DEPENDENCY_CHECK',
-            defaultValue: true,
-            description: 'Run OWASP Dependency-Check and archive the reports.'
-        )
-
-        booleanParam(
-            name: 'RUN_CONTAINER_SCANS',
-            defaultValue: true,
-            description: 'Run Trivy scans against all deployed container images.'
-        )
-
-        booleanParam(
-            name: 'RUN_ZAP',
-            defaultValue: false,
-            description: 'Run the OWASP ZAP baseline scan after deployment.'
-        )
-
-        string(
-            name: 'DEVELOPER_EMAIL',
-            defaultValue: 'evan246810536546@gmail.com',
-            description: 'Email address that receives vulnerability and pipeline-failure alerts.'
-        )
-    }
-
     triggers {
-        // Jenkins checks the configured Git repository every two minutes.
+        // Jenkins checks the configured Git repository every minute.
         // A new commit automatically starts the pipeline.
         pollSCM('* * * * *')
     }
@@ -52,6 +26,13 @@ pipeline {
         PENPOT_URL = 'https://localhost:8443'
 
         REPORT_DIRECTORY = 'reports'
+
+        // Fixed automatic-build settings: no Jenkins build parameters are required.
+        // Expensive optional scanners are disabled for faster SCM-triggered demonstrations.
+        RUN_DEPENDENCY_CHECK = 'false'
+        RUN_CONTAINER_SCANS = 'false'
+        RUN_ZAP = 'false'
+        DEVELOPER_EMAIL = 'evan246810536546@gmail.com'
 
         // Local-lab values. Jenkins credentials should replace these in production.
         PENPOT_DATABASE_PASSWORD = 'ubuntu'
@@ -490,27 +471,21 @@ PYTHON_TESTS
 
                     cat > semgrep-rules/security-canary.yml <<'SEMGREP_RULES'
 rules:
-  - id: intentionally-vulnerable-eval-canary
-    message: Unsafe eval() detected. Untrusted input passed to eval can result in arbitrary code execution.
+  - id: penpot-source-unsafe-eval
+    message: Unsafe eval() detected in Penpot source code. Untrusted input could be executed as code.
     severity: ERROR
     languages:
-      - python
+      - typescript
+      - javascript
     pattern: eval($INPUT)
 
-  - id: intentionally-vulnerable-shell-canary
-    message: subprocess.run() with shell=True can create command-injection risk when command data is untrusted.
+  - id: penpot-source-dynamic-function
+    message: Dynamic Function construction detected in Penpot source code. Untrusted input could be executed as code.
     severity: ERROR
     languages:
-      - python
-    patterns:
-      - pattern: subprocess.run(..., shell=True, ...)
-
-  - id: intentionally-vulnerable-os-system-canary
-    message: os.system() can introduce command injection when the command contains untrusted data.
-    severity: ERROR
-    languages:
-      - python
-    pattern: os.system($COMMAND)
+      - typescript
+      - javascript
+    pattern: new Function($INPUT)
 SEMGREP_RULES
 
                     python3 - <<'PYTHON_VALIDATE_RULES'
@@ -518,8 +493,8 @@ from pathlib import Path
 
 rule_file = Path("semgrep-rules/security-canary.yml")
 assert rule_file.exists()
-assert "intentionally-vulnerable-eval-canary" in rule_file.read_text()
-print("Custom Semgrep security-canary rules created.")
+assert "penpot-source-unsafe-eval" in rule_file.read_text()
+print("Custom Penpot source-code Semgrep rules created.")
 PYTHON_VALIDATE_RULES
                 '''
             }
@@ -891,7 +866,7 @@ PYTHON_SEMGREP_RESULTS
         stage('OWASP Dependency-Check') {
             when {
                 expression {
-                    return params.RUN_DEPENDENCY_CHECK
+                    return env.RUN_DEPENDENCY_CHECK == 'true'
                 }
             }
 
@@ -1251,7 +1226,7 @@ PYTHON_SEMGREP_RESULTS
         stage('Container Image Vulnerability Scans') {
             when {
                 expression {
-                    return params.RUN_CONTAINER_SCANS
+                    return env.RUN_CONTAINER_SCANS == 'true'
                 }
             }
 
@@ -1452,7 +1427,7 @@ PYTHON_SEMGREP_RESULTS
         stage('OWASP ZAP Baseline') {
             when {
                 expression {
-                    return params.RUN_ZAP
+                    return env.RUN_ZAP == 'true'
                 }
             }
 
@@ -1543,10 +1518,60 @@ semgrep_results = []
 canary_findings = []
 
 canary_rule_ids = {
-    "intentionally-vulnerable-eval-canary",
-    "intentionally-vulnerable-shell-canary",
-    "intentionally-vulnerable-os-system-canary",
+    "penpot-source-unsafe-eval",
+    "penpot-source-dynamic-function",
 }
+
+
+def matched_source(path_text: str, start_line, end_line) -> str:
+    workspace = Path.cwd().resolve()
+    raw_path = Path(path_text)
+
+    if raw_path.is_absolute():
+        try:
+            relative_path = raw_path.relative_to("/src")
+        except ValueError:
+            relative_path = Path(*raw_path.parts[1:])
+    else:
+        relative_path = raw_path
+
+    candidate = (workspace / relative_path).resolve()
+
+    # Do not read outside the checked-out Jenkins workspace.
+    if candidate != workspace and workspace not in candidate.parents:
+        return "Source excerpt unavailable: path resolved outside workspace."
+
+    if not candidate.is_file():
+        return "Source excerpt unavailable: source file was not found."
+
+    try:
+        source_lines = candidate.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).splitlines()
+    except Exception as exc:
+        return f"Source excerpt unavailable: {exc}"
+
+    try:
+        first = max(int(start_line), 1)
+        last = max(int(end_line), first)
+    except (TypeError, ValueError):
+        return "Source excerpt unavailable: invalid line information."
+
+    # Keep email/report excerpts concise.
+    last = min(last, first + 19)
+
+    excerpt = []
+
+    for line_number in range(first, last + 1):
+        index = line_number - 1
+
+        if index < len(source_lines):
+            excerpt.append(
+                f"{line_number}: {source_lines[index]}"
+            )
+
+    return "\\n".join(excerpt) or "Source excerpt was empty."
 
 if semgrep_path.exists():
     try:
@@ -1562,19 +1587,30 @@ if semgrep_path.exists():
                 continue
 
             path = finding.get("path", "unknown-file")
-            line = (finding.get("start") or {}).get("line", "?")
+            start = finding.get("start") or {}
+            end = finding.get("end") or {}
+            start_line = start.get("line", "?")
+            end_line = end.get("line", start_line)
             severity = (finding.get("extra") or {}).get(
                 "severity",
                 "ERROR",
             )
             message = (finding.get("extra") or {}).get(
                 "message",
-                "Intentional security canary detected.",
+                "Unsafe source-code pattern detected.",
+            )
+            source_excerpt = matched_source(
+                str(path),
+                start_line,
+                end_line,
             )
 
             canary_findings.append(
-                f"[{severity}] {normalized_rule} - "
-                f"{path}:{line} - {message}"
+                f"[{severity}] {normalized_rule}\\n"
+                f"File: {path}\\n"
+                f"Lines: {start_line}-{end_line}\\n"
+                f"Reason: {message}\\n"
+                f"Matched source code:\\n{source_excerpt}"
             )
     except Exception:
         semgrep_count = 0
@@ -1585,7 +1621,7 @@ else:
 canary_count = len(canary_findings)
 
 summary.append(f"Semgrep Penpot source findings: {semgrep_count}")
-summary.append(f"Intentional vulnerability-canary findings: {canary_count}")
+summary.append(f"Targeted Penpot source-code findings: {canary_count}")
 total += semgrep_count
 
 notification = reports / "notification"
@@ -1598,14 +1634,19 @@ notification.mkdir(parents=True, exist_ok=True)
 
 if canary_findings:
     canary_text = (
-        "INTENTIONAL SECURITY CANARY DETECTED\\n"
+        "UNSAFE CODE DETECTED IN PENPOT SOURCE\\n"
         + "\\n".join(canary_findings)
         + "\\n"
     )
 else:
-    canary_text = "No intentional security-canary findings detected.\\n"
+    canary_text = "No targeted unsafe source-code findings detected.\\n"
 
 (notification / "canary-findings.txt").write_text(
+    canary_text,
+    encoding="utf-8",
+)
+
+(notification / "unsafe-source-code-findings.txt").write_text(
     canary_text,
     encoding="utf-8",
 )
@@ -1675,7 +1716,7 @@ PYTHON_SUMMARY
         stage('Email Developer Notification') {
             steps {
                 script {
-                    String notificationRecipient = (params.DEVELOPER_EMAIL ?: '').trim()
+                    String notificationRecipient = (env.DEVELOPER_EMAIL ?: '').trim()
                     if (!notificationRecipient) {
                         notificationRecipient = 'evan246810536546@gmail.com'
                     }
@@ -1711,7 +1752,11 @@ PYTHON_SUMMARY
                         }
                     }
 
-                    if (fileExists('reports/notification/canary-findings.txt')) {
+                    if (fileExists('reports/notification/unsafe-source-code-findings.txt')) {
+                        canaryText = readFile(
+                            'reports/notification/unsafe-source-code-findings.txt'
+                        ).trim()
+                    } else if (fileExists('reports/notification/canary-findings.txt')) {
                         canaryText = readFile(
                             'reports/notification/canary-findings.txt'
                         ).trim()
@@ -1719,7 +1764,7 @@ PYTHON_SUMMARY
 
                     if (findingCount > 0 || canaryCount > 0) {
                         String emailSubject = canaryCount > 0
-                            ? "[Penpot DevSecOps] SECURITY CANARY DETECTED (${canaryCount}) - Build #${env.BUILD_NUMBER}"
+                            ? "[Penpot DevSecOps] UNSAFE SOURCE CODE DETECTED (${canaryCount}) - Build #${env.BUILD_NUMBER}"
                             : "[Penpot DevSecOps] ${findingCount} security findings detected - Build #${env.BUILD_NUMBER}"
 
                         String emailBody = [
@@ -1733,7 +1778,7 @@ PYTHON_SUMMARY
                             'Security summary:',
                             summaryText,
                             '',
-                            'Controlled vulnerability-canary result:',
+                            'Matched Penpot source-code result:',
                             canaryText,
                             '',
                             'Jenkins build:',
@@ -1748,7 +1793,7 @@ PYTHON_SUMMARY
                             subject: emailSubject,
                             mimeType: 'text/plain',
                             attachLog: false,
-                            attachmentsPattern: 'reports/notification/security-summary.txt,reports/notification/canary-findings.txt,reports/semgrep/penpot-source-summary.txt',
+                            attachmentsPattern: 'reports/notification/security-summary.txt,reports/notification/unsafe-source-code-findings.txt,reports/semgrep/penpot-source-summary.txt',
                             body: emailBody
                         )
 
@@ -1765,7 +1810,7 @@ PYTHON_SUMMARY
                         )
 
                         if (canaryCount > 0) {
-                            echo "SECURITY CANARY DETECTED: ${canaryCount} controlled vulnerable-code finding(s)."
+                            echo "UNSAFE SOURCE CODE DETECTED: ${canaryCount} targeted finding(s)."
                             echo canaryText
                             currentBuild.result = 'UNSTABLE'
                         }
@@ -1833,7 +1878,7 @@ PYTHON_SUMMARY
 
         failure {
             script {
-                String failureRecipient = (params.DEVELOPER_EMAIL ?: '').trim()
+                String failureRecipient = (env.DEVELOPER_EMAIL ?: '').trim()
                 if (!failureRecipient) {
                     failureRecipient = 'evan246810536546@gmail.com'
                 }
