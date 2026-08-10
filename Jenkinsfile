@@ -29,9 +29,9 @@ pipeline {
 
         // Fixed automatic-build settings: no Jenkins build parameters are required.
         // Expensive optional scanners are disabled for faster SCM-triggered demonstrations.
-        RUN_DEPENDENCY_CHECK = 'false'
+        RUN_DEPENDENCY_CHECK = 'true'
         RUN_CONTAINER_SCANS = 'false'
-        RUN_ZAP = 'false'
+        RUN_ZAP = 'true'
         DEVELOPER_EMAIL = 'evan246810536546@gmail.com'
 
         // Local-lab values. Jenkins credentials should replace these in production.
