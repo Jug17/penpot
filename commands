@@ -1,0 +1,14 @@
+#The Source code file
+sudo nano mcp/packages/server/src/index.ts
+
+#Commit The chamnge
+git commit -m "Add controlled unsafe-code pattern for Semgrep validation"
+
+#Push the changes
+git push origin develop
+
+#Pull if not up to date
+git pull origin develop
+
+#Run this to Auto Push
+~/auto-push-penpot.sh
