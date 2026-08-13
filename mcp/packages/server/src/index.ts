@@ -66,17 +66,3 @@ if (import.meta.url.endsWith(process.argv[1]) || process.argv[1].endsWith("index
     });
 }
 
-/**
- * DEVSECOPS DEMONSTRATION ONLY.
- * This intentionally unsafe pattern is unreachable and must be removed
- * after the Semgrep evidence is collected.
- */
-function devSecOpsSecurityCanary(userInput: string): unknown {
-  if (false) {
-    return eval(userInput);
-  }
-
-  return userInput;
-}
-
-void devSecOpsSecurityCanary;
